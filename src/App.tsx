@@ -50,81 +50,60 @@ interface DataGridProps {
  * Computes statistics for numeric columns in a single pass
  */
 const convertToColumnar = (rows: RowData[]): ColumnarResult => {
-    if (!rows || rows.length === 0) {
+    const rowCount = rows.length;
+    if (rowCount === 0) {
         return { columns: [], data: {}, rowCount: 0, stats: {} };
     }
 
-    // Start optimistically: assume uniform data (fast path)
-    const columns = Object.keys(rows[0]);
     const data: ColumnarData = {};
-    const stats: { [key: string]: ColumnStats } = {};
+    const stats: Record<string, ColumnStats> = {};
+    const columns = new Set<string>();  // O(1) lookup!
 
-    // Pre-allocate arrays for known columns
-    columns.forEach(col => {
-        data[col] = new Array(rows.length);
-    });
-
-    // Track all columns (for sparse data detection)
-    const allColumns = new Set(columns);
-
-    // Single pass: convert + compute stats
     rows.forEach((row, i) => {
-        // Check for new columns (sparse data handling)
-        Object.keys(row).forEach(key => {
-            if (!allColumns.has(key)) {
-                allColumns.add(key);
-                // Backfill new column with nulls for previous rows
-                data[key] = new Array(i).fill(null);
-            }
-        });
-
-        // Assign values and compute stats
-        allColumns.forEach(col => {
-            const value = row[col] ?? null;
-
-            // Ensure array exists for this column
-            if (!data[col]) {
-                data[col] = new Array(i).fill(null);
+        Object.entries(row).forEach(([col, value]) => {
+            let val: unknown = value ?? null;
+            if (typeof val === 'number' && isNaN(val)) {
+                val = null;
             }
 
-            data[col][i] = value;
+            // First time seeing this column?
+            if (!columns.has(col)) {
+                columns.add(col);
+                // Pre-allocate array for ALL rows
+                data[col] = new Array(rowCount).fill(null);
+            }
 
-            // Compute stats for numeric columns on the fly
-            if (typeof value === 'number' && !isNaN(value) && col != 'id') {
+            data[col][i] = val;
+
+            // Compute stats
+            if (typeof val === 'number') {
                 if (!stats[col]) {
                     stats[col] = {
-                        min: value,
-                        max: value,
-                        sum: value,
+                        min: val,
+                        max: val,
+                        sum: val,
                         count: 1,
                         mean: 0
                     };
                 } else {
-                    stats[col].min = Math.min(stats[col].min, value);
-                    stats[col].max = Math.max(stats[col].max, value);
-                    stats[col].sum += value;
+                    stats[col].min = Math.min(stats[col].min, val);
+                    stats[col].max = Math.max(stats[col].max, val);
+                    stats[col].sum += val;
                     stats[col].count++;
                 }
-            }
-        });
-
-        // Fill nulls for columns missing in this row
-        allColumns.forEach(col => {
-            if (data[col].length === i) {
-                data[col].push(null);
             }
         });
     });
 
     // Calculate means
-    Object.keys(stats).forEach(col => {
-        stats[col].mean = stats[col].sum / stats[col].count;
+    Object.values(stats).forEach(s => {
+        s.mean = s.sum / s.count;
     });
 
     return {
-        columns: Array.from(allColumns),
+        columns: Array.from(columns),
         data,
-        rowCount: rows.length,
+        rowCount,
         stats
     };
 };
@@ -144,7 +123,32 @@ const inferType = (columnData: any[]): DataType => {
     // Check if it's a date string
     if (typeof sample === 'string') {
         const dateTest = new Date(sample);
-        if (!isNaN(dateTest.getTime()) && sample.match(/\d{4}-\d{2}-\d{2}/)) {
+        if (!isNaN(dateTest.getTime())) {
+            // ISO 8601 with timezone: "2024-01-15T10:30:00Z" or "2024-01-15T10:30:00+00:00"
+            if (sample.match(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{3})?([+-]\d{2}:\d{2}|Z)?$/)) {
+                return 'date';
+            }
+            // Simple ISO date: "2024-01-15"
+            if (sample.match(/^\d{4}-\d{2}-\d{2}$/)) {
+                return 'date';
+            }
+            // Common formats like "01/15/2024" or "15-Jan-2024"
+            if (sample.match(/^\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4}$/) ||
+                sample.match(/^\d{1,2}-[A-Za-z]{3}-\d{2,4}$/)) {
+                return 'date';
+            }
+        }
+    }
+
+    // Unix timestamp (milliseconds): 1704000000000
+    if (typeof sample === 'number' && sample > 946684800000 && sample < 4102444800000) {
+        return 'date';
+    }
+
+    // Unix timestamp as string: "1704000000000"
+    if (typeof sample === 'string' && sample.match(/^\d{10,13}$/)) {
+        const num = parseInt(sample);
+        if (num > 946684800000 && num < 4102444800000) {
             return 'date';
         }
     }
