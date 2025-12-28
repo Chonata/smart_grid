@@ -17,11 +17,18 @@ interface ColumnStats {
     count: number; // non-null count
 }
 
+interface CategoryEncoding {
+    dictionary: (string | boolean)[];                 // unique values in order
+    encoded: Int8Array;                                // indices into dictionary (-1 for null)
+    counts: Map<string | boolean, number>;            // frequency of each value
+}
+
 interface ColumnarResult {
     columns: string[];
     data: ColumnarData;
     rowCount: number;
     stats: { [columnName: string]: ColumnStats };
+    categories: { [columnName: string]: CategoryEncoding };  // dictionary-encoded columns
 }
 
 type DataType = 'number' | 'boolean' | 'date' | 'string';
@@ -48,16 +55,25 @@ interface DataGridProps {
  * Converts row-based data to columnar format
  * Optimized for uniform data but handles sparse data gracefully
  * Computes statistics for numeric columns in a single pass
+ * Dictionary-encodes categorical columns (cardinality < ln(rowCount))
  */
 const convertToColumnar = (rows: RowData[]): ColumnarResult => {
     const rowCount = rows.length;
     if (rowCount === 0) {
-        return { columns: [], data: {}, rowCount: 0, stats: {} };
+        return { columns: [], data: {}, rowCount: 0, stats: {}, categories: {} };
     }
 
     const data: ColumnarData = {};
     const stats: Record<string, ColumnStats> = {};
+    const categories: Record<string, CategoryEncoding> = {};
     const columns = new Set<string>();  // O(1) lookup!
+
+    // Categorical detection threshold
+    const cardinalityThreshold = Math.log(rowCount);
+
+    // Track unique values per column for categorical detection (non-numeric only)
+    // Stop tracking once threshold is exceeded to save memory
+    const uniqueValues: Record<string, Set<string | boolean> | null> = {};
 
     rows.forEach((row, i) => {
         Object.entries(row).forEach(([col, value]) => {
@@ -75,7 +91,23 @@ const convertToColumnar = (rows: RowData[]): ColumnarResult => {
 
             data[col][i] = val;
 
-            // Compute stats
+            // Track unique values for NON-NUMERIC columns only
+            // Stop tracking once cardinality exceeds threshold to save memory
+            if (uniqueValues[col] !== null && (typeof val === 'string' || typeof val === 'boolean')) {
+                // Initialize Set on first non-null value
+                if (uniqueValues[col] === undefined) {
+                    uniqueValues[col] = new Set();
+                }
+
+                uniqueValues[col].add(val); // Always add first
+
+                // Exceeded threshold? Stop tracking this column
+                if (uniqueValues[col].size >= cardinalityThreshold) {
+                    uniqueValues[col] = null;
+                }
+            }
+
+            // Compute stats for numeric columns
             if (typeof val === 'number') {
                 if (!stats[col]) {
                     stats[col] = {
@@ -100,11 +132,55 @@ const convertToColumnar = (rows: RowData[]): ColumnarResult => {
         s.mean = s.sum / s.count;
     });
 
+    // Dictionary-encode categorical columns (non-numeric only)
+    // Heuristic: cardinality < ln(rowCount)
+    Object.entries(uniqueValues).forEach(([col, uniqueSet]) => {
+        // Skip columns that exceeded threshold (set to null)
+        if (uniqueSet === null) return;
+
+        // Sort dictionary (booleans first, then strings alphabetically)
+        const dictionary = Array.from(uniqueSet).sort((a, b) => {
+            if (typeof a === 'boolean' && typeof b === 'boolean') {
+                return a === b ? 0 : a ? -1 : 1; // true before false
+            }
+            return String(a).localeCompare(String(b));
+        });
+
+        const valueToIndex = new Map(dictionary.map((val, idx) => [val, idx]));
+        const counts = new Map<string | boolean, number>();
+
+        // Initialize counts
+        dictionary.forEach(val => counts.set(val, 0));
+
+        // Encode the column and count frequencies using Int8Array
+        const encoded = new Int8Array(rowCount);
+        for (let i = 0; i < rowCount; i++) {
+            const val = data[col][i];
+            if (val === null) {
+                encoded[i] = -1;  // special marker for null
+            } else {
+                const typedVal = val as string | boolean;
+                encoded[i] = valueToIndex.get(typedVal)!;
+                counts.set(typedVal, counts.get(typedVal)! + 1);
+            }
+        }
+
+        categories[col] = {
+            dictionary,
+            encoded,
+            counts
+        };
+        // Delete original data to save memory - we only need the encoded version
+        delete data[col];
+        console.log(data)
+    });
+
     return {
         columns: Array.from(columns),
         data,
         rowCount,
-        stats
+        stats,
+        categories
     };
 };
 
@@ -118,38 +194,33 @@ const inferType = (columnData: any[]): DataType => {
     if (sample === undefined) return 'string';
 
     if (typeof sample === 'boolean') return 'boolean';
-    if (typeof sample === 'number') return 'number';
+    // Unix timestamp (milliseconds): 1704000000000
+    if (typeof sample === 'number') {
+        return sample > 946684800000 && sample < 4102444800000 ? 'date' : 'number';
+    }
 
     // Check if it's a date string
     if (typeof sample === 'string') {
         const dateTest = new Date(sample);
         if (!isNaN(dateTest.getTime())) {
-            // ISO 8601 with timezone: "2024-01-15T10:30:00Z" or "2024-01-15T10:30:00+00:00"
-            if (sample.match(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{3})?([+-]\d{2}:\d{2}|Z)?$/)) {
-                return 'date';
-            }
-            // Simple ISO date: "2024-01-15"
+            // ISO date: "2024-02-01"
             if (sample.match(/^\d{4}-\d{2}-\d{2}$/)) {
                 return 'date';
             }
-            // Common formats like "01/15/2024" or "15-Jan-2024"
-            if (sample.match(/^\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4}$/) ||
-                sample.match(/^\d{1,2}-[A-Za-z]{3}-\d{2,4}$/)) {
+            // ISO 8601 with time: "2024-01-15T10:30:00Z" or "2024-01-15T10:30:00+00:00"
+            if (sample.match(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{3})?([+-]\d{2}:\d{2}|Z)?$/)) {
                 return 'date';
             }
-        }
-    }
-
-    // Unix timestamp (milliseconds): 1704000000000
-    if (typeof sample === 'number' && sample > 946684800000 && sample < 4102444800000) {
-        return 'date';
-    }
-
-    // Unix timestamp as string: "1704000000000"
-    if (typeof sample === 'string' && sample.match(/^\d{10,13}$/)) {
-        const num = parseInt(sample);
-        if (num > 946684800000 && num < 4102444800000) {
-            return 'date';
+            // JavaScript toString(): "Tue Feb 01 2024 10:30:00 GMT+0000 (UTC)"
+            if (sample.match(/^[A-Z][a-z]{2}\s[A-Z][a-z]{2}\s\d{2}\s\d{4}/)) {
+                return 'date';
+            }
+            if (sample.match(/^\d{10,13}$/)) {
+                const num = parseInt(sample);
+                if (num > 946684800000 && num < 4102444800000) {
+                    return 'date';
+                }
+            }
         }
     }
 
@@ -168,7 +239,7 @@ const formatValue = (value: any, type: DataType): string => {
         case 'date':
             return new Date(value).toLocaleDateString();
         case 'boolean':
-            return value ? '✓' : '✗';
+            return value ? "✅" : "❌️";
         default:
             return String(value);
     }
@@ -181,7 +252,7 @@ const DataGrid: React.FC<DataGridProps> = ({ data = [], columnOverrides = {} }) 
     const [hoveredColumn, setHoveredColumn] = useState<string | null>(null);
 
     // Convert to columnar format and compute stats
-    const { columns, data: columnarData, rowCount, stats } = useMemo(
+    const { columns, data: columnarData, rowCount, stats, categories } = useMemo(
         () => convertToColumnar(data),
         [data]
     );
@@ -190,10 +261,15 @@ const DataGrid: React.FC<DataGridProps> = ({ data = [], columnOverrides = {} }) 
     const columnTypes: ColumnTypeMap = useMemo(() => {
         const types: ColumnTypeMap = {};
         columns.forEach(col => {
-            types[col] = inferType(columnarData[col]);
+            // For categorical columns, infer type from dictionary values
+            if (categories[col]) {
+                types[col] = inferType(categories[col].dictionary);
+            } else {
+                types[col] = inferType(columnarData[col]);
+            }
         });
         return types;
-    }, [columns, columnarData]);
+    }, [columns, columnarData, categories]);
 
     // Generate display names for columns (convert camelCase to Title Case)
     const getDisplayName = (columnName: string): string => {
@@ -224,6 +300,8 @@ const DataGrid: React.FC<DataGridProps> = ({ data = [], columnOverrides = {} }) 
                 <tr>
                     {columns.map((col, index) => {
                         const hasStats = stats[col] !== undefined;
+                        const isCategorical = categories[col] !== undefined;
+                        const showStatsTooltip = hasStats && !isCategorical;
                         const isHovered = hoveredColumn === col;
 
                         return (
@@ -241,7 +319,7 @@ const DataGrid: React.FC<DataGridProps> = ({ data = [], columnOverrides = {} }) 
                                     top: 0,
                                     fontSize: '14px',
                                     color: '#333',
-                                    cursor: hasStats ? 'help' : 'default',
+                                    cursor: showStatsTooltip ? 'help' : 'default',
                                     transition: 'background-color 0.2s',
                                     verticalAlign: 'top'
                                 }}
@@ -259,7 +337,7 @@ const DataGrid: React.FC<DataGridProps> = ({ data = [], columnOverrides = {} }) 
                                 </div>
 
                                 {/* Stats tooltip on hover */}
-                                {hasStats && isHovered && (
+                                {showStatsTooltip && isHovered && (
                                     <div style={{
                                         position: 'absolute',
                                         top: '100%',
@@ -303,7 +381,18 @@ const DataGrid: React.FC<DataGridProps> = ({ data = [], columnOverrides = {} }) 
                         }}
                     >
                         {columns.map((col, colIndex) => {
-                            const value = columnarData[col][rowIndex];
+                            const isCategorical = categories[col] !== undefined;
+                            let value: any;
+
+                            if (isCategorical) {
+                                // Decode from dictionary
+                                const encodedIndex = categories[col].encoded[rowIndex];
+                                value = encodedIndex === -1 ? null : categories[col].dictionary[encodedIndex];
+                            } else {
+                                // Use original data
+                                value = columnarData[col][rowIndex];
+                            }
+
                             const type = columnTypes[col];
 
                             return (
@@ -335,7 +424,7 @@ const DataGrid: React.FC<DataGridProps> = ({ data = [], columnOverrides = {} }) 
             }}>
                 {rowCount.toLocaleString()} rows × {columns.length} columns
                 <span style={{ marginLeft: '16px', color: '#999' }}>
-          Columnar storage • {Object.keys(stats).length} numeric columns with stats
+          Columnar storage • {Object.keys(stats).length} numeric columns with stats • {Object.keys(categories).length} categorical columns
         </span>
             </div>
         </div>
@@ -354,6 +443,15 @@ function App() {
         { id: 6, name: 'Fiona Apple', age: 31, city: 'Berlin', salary: 91000, isActive: true, joinDate: '2022-08-12' },
         // Sparse data - missing 'city' field
         { id: 7, name: 'George Wilson', age: 42, salary: 87000, isActive: false, joinDate: '2020-09-18' },
+        // Add more rows to make categorical encoding kick in
+        { id: 8, name: 'Hannah Montana', age: 26, city: 'New York', salary: 79000, isActive: true, joinDate: '2023-03-15' },
+        { id: 9, name: 'Ian McKellen', age: 52, city: 'London', salary: 95000, isActive: true, joinDate: '2019-07-22' },
+        { id: 10, name: 'Julia Roberts', age: 35, city: 'Paris', salary: 82000, isActive: false, joinDate: '2022-05-30' },
+        { id: 11, name: 'Kevin Hart', age: 29, city: 'New York', salary: 86000, isActive: true, joinDate: '2023-01-10' },
+        { id: 12, name: 'Laura Croft', age: 33, city: 'Tokyo', salary: 89000, isActive: true, joinDate: '2021-09-14' },
+        { id: 13, name: 'Michael Scott', age: 41, city: 'Sydney', salary: 77000, isActive: false, joinDate: '2020-11-25' },
+        { id: 14, name: 'Nina Simone', age: 27, city: 'Berlin', salary: 83000, isActive: true, joinDate: '2023-04-18' },
+        { id: 15, name: 'Oscar Isaac', age: 39, city: 'London', salary: 94000, isActive: true, joinDate: '2021-08-07' },
     ];
 
     return (
